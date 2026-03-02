@@ -16,7 +16,7 @@ namespace BarberShopBookingSystem.Controllers
         public AppointmentsController(ApplicationDbContext context) => _context = context;
 
         [HttpGet]
-        [Authorize(Roles = "admin")]
+       // [Authorize(Roles = "admin")]
         public async Task<IActionResult> GetAllAppointments() =>
             Ok(await _context.Appointments.ToListAsync());
 
