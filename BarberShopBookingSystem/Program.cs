@@ -3,6 +3,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using System.Text;
+using Resend; // Added for the Resend email client
+using BarberShopBookingSystem.Services; // Added to locate your new EmailService
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -53,6 +55,21 @@ builder.Services.AddCors(options =>
                   .AllowAnyHeader();
         });
 });
+
+// --- NEW NOTIFICATION SYSTEM REGISTRATION ---
+builder.Services.AddOptions();
+builder.Services.AddHttpClient<ResendClient>();
+builder.Services.Configure<ResendClientOptions>(options =>
+{
+    // This pulls the key directly from your appsettings.json
+    options.ApiToken = builder.Configuration["Resend:ApiKey"];
+});
+builder.Services.AddTransient<IResend, ResendClient>();
+
+// Registers your custom email service so the controller can use it
+builder.Services.AddTransient<IEmailService, EmailService>();
+// --------------------------------------------
+// --------------------------------------------
 
 var app = builder.Build();
 

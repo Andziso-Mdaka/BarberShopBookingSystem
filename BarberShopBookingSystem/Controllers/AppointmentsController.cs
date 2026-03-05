@@ -1,5 +1,6 @@
 ﻿using BarberShopBookingSystem.Data;
 using BarberShopBookingSystem.Models;
+using BarberShopBookingSystem.Services; // Add this for the IEmailService
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -16,7 +17,6 @@ namespace BarberShopBookingSystem.Controllers
         public AppointmentsController(ApplicationDbContext context) => _context = context;
 
         [HttpGet]
-       // [Authorize(Roles = "admin")]
         public async Task<IActionResult> GetAllAppointments() =>
             Ok(await _context.Appointments.ToListAsync());
 
@@ -43,40 +43,47 @@ namespace BarberShopBookingSystem.Controllers
 
             var appointmentDateUtc = dto.AppointmentDate.Date;
 
-            var barber = await _context.Barbers.FindAsync(dto.BarberId);
-            if (barber == null) return NotFound("Barber not found");
+            // POLICY: 30-Minute Minimum Notice
+            if (DateTime.TryParse($"{appointmentDateUtc.ToShortDateString()} {dto.TimeSlot}", out DateTime requestedTime))
+            {
+                var localTimeNow = DateTime.UtcNow.AddHours(2); // SAST timezone
+                if (requestedTime < localTimeNow.AddMinutes(30))
+                {
+                    return BadRequest("Appointments must be booked at least 30 minutes in advance.");
+                }
+            }
 
             var haircut = await _context.Haircuts.FindAsync(dto.HaircutId);
             if (haircut == null) return NotFound("Haircut not found");
 
-            var conflict = await _context.Appointments.AnyAsync(a =>
-                a.BarberId == dto.BarberId &&
-                a.AppointmentDate == appointmentDateUtc &&
-                a.TimeSlot == dto.TimeSlot &&
-                a.Status != "cancelled");
+            // POLICY: Auto-Assign Available Barber
+            var allActiveBarbers = await _context.Barbers.Where(b => b.Available).ToListAsync();
+            var bookedBarberIds = await _context.Appointments
+                .Where(a => a.AppointmentDate == appointmentDateUtc &&
+                            a.TimeSlot == dto.TimeSlot &&
+                            a.Status != "cancelled")
+                .Select(a => a.BarberId)
+                .ToListAsync();
 
-            if (conflict) return BadRequest("Barber already booked at this time.");
+            var assignedBarber = allActiveBarbers.FirstOrDefault(b => !bookedBarberIds.Contains(b.Id));
+            if (assignedBarber == null) return BadRequest("No barbers are available for this time slot.");
 
-            // DISCOUNT POLICY: Only one discount applied per booking
             decimal finalPrice = haircut.Price;
-            if (dto.DiscountAmount > 0)
-            {
-                finalPrice -= dto.DiscountAmount;
-            }
+            if (dto.DiscountAmount > 0) finalPrice -= dto.DiscountAmount;
 
             var appointment = new Appointment
             {
                 Id = Guid.NewGuid(),
                 UserId = userId,
-                BarberId = dto.BarberId,
+                BarberId = assignedBarber.Id, // Auto-assigned
                 HaircutId = dto.HaircutId,
                 AppointmentDate = appointmentDateUtc,
                 TimeSlot = dto.TimeSlot,
                 Status = "pending",
                 PaymentStatus = "unpaid",
                 RescheduleCount = 0,
-                TotalPrice = finalPrice, // Stores the final price after the single discount
-                AppliedDiscountCode = dto.DiscountCode // Track for "no combined discounts" policy
+                TotalPrice = finalPrice,
+                AppliedDiscountCode = dto.DiscountCode
             };
 
             _context.Appointments.Add(appointment);
@@ -91,9 +98,22 @@ namespace BarberShopBookingSystem.Controllers
             var appointment = await _context.Appointments.FindAsync(id);
             if (appointment == null) return NotFound();
 
-            // RESCHEDULE POLICY: Only one reschedule allowed per booking
+            // POLICY: Only one reschedule allowed per booking
             if (appointment.RescheduleCount >= 1)
                 return BadRequest("Policy: Only one reschedule allowed. Please make a new booking.");
+
+            // POLICY: 2-Hour Notice Rule
+            if (DateTime.TryParse($"{appointment.AppointmentDate.ToShortDateString()} {appointment.TimeSlot}", out DateTime currentScheduledTime))
+            {
+                var localTimeNow = DateTime.UtcNow.AddHours(2); // SAST Time
+                var timeUntilAppointment = currentScheduledTime - localTimeNow;
+
+                // If the appointment is in the future but less than 2 hours away
+                if (timeUntilAppointment.TotalHours < 2 && timeUntilAppointment.TotalHours > 0)
+                {
+                    return BadRequest("Policy: Rescheduling requires at least 2 hours' notice.");
+                }
+            }
 
             var conflict = await _context.Appointments.AnyAsync(a =>
                 a.Id != id &&
@@ -119,20 +139,33 @@ namespace BarberShopBookingSystem.Controllers
             var appointment = await _context.Appointments.FindAsync(id);
             if (appointment == null) return NotFound();
 
-            // BOOKING POLICY: 30 minutes late requires reschedule
-            if (minutesLate >= 30)
-            {
-                return BadRequest("Policy: 30 minutes late requires rescheduling to next slot.");
-            }
-
-            // BOOKING POLICY: 15-minute grace period (+R10 if exceeded)
-            if (minutesLate > 15)
-            {
-                appointment.TotalPrice += 10;
-            }
+            if (minutesLate >= 30) return BadRequest("Policy: 30 minutes late requires rescheduling to next slot.");
+            if (minutesLate > 15) appointment.TotalPrice += 10;
 
             await _context.SaveChangesAsync();
             return Ok(appointment);
+        }
+
+        [HttpPut("{id}/cancel")]
+        [Authorize(Roles = "admin")]
+        public async Task<IActionResult> CancelAppointment(Guid id, [FromServices] IEmailService emailService)
+        {
+            var appointment = await _context.Appointments.FindAsync(id);
+            if (appointment == null) return NotFound();
+
+            appointment.Status = "cancelled";
+            await _context.SaveChangesAsync();
+
+            // Look up the customer's profile to get their email
+            var profile = await _context.Profiles.FindAsync(appointment.UserId);
+
+            if (profile != null && !string.IsNullOrEmpty(profile.Email))
+            {
+                // Send the notification using the real email!
+                await emailService.SendCancellationEmail(profile.Email, appointment.AppointmentDate.ToShortDateString(), appointment.TimeSlot);
+            }
+
+            return Ok("Appointment cancelled and notification sent.");
         }
     }
 
@@ -140,16 +173,5 @@ namespace BarberShopBookingSystem.Controllers
     {
         public DateTime NewDate { get; set; }
         public string NewTime { get; set; } = string.Empty;
-    }
-
-    // Ensure your DTO in the Models folder matches this
-    public class AppointmentCreateDto
-    {
-        public Guid BarberId { get; set; }
-        public Guid HaircutId { get; set; }
-        public DateTime AppointmentDate { get; set; }
-        public string TimeSlot { get; set; } = string.Empty;
-        public decimal DiscountAmount { get; set; }
-        public string? DiscountCode { get; set; }
     }
 }
