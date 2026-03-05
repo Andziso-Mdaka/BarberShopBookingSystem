@@ -56,17 +56,27 @@ namespace BarberShopBookingSystem.Controllers
             var haircut = await _context.Haircuts.FindAsync(dto.HaircutId);
             if (haircut == null) return NotFound("Haircut not found");
 
-            // POLICY: Auto-Assign Available Barber
+            // POLICY: Auto-Assign Available Barber (Load Balanced)
             var allActiveBarbers = await _context.Barbers.Where(b => b.Available).ToListAsync();
-            var bookedBarberIds = await _context.Appointments
-                .Where(a => a.AppointmentDate == appointmentDateUtc &&
-                            a.TimeSlot == dto.TimeSlot &&
-                            a.Status != "cancelled")
-                .Select(a => a.BarberId)
+
+            // 1. Get ALL appointments for this specific day to calculate their workloads
+            var todaysAppointments = await _context.Appointments
+                .Where(a => a.AppointmentDate == appointmentDateUtc && a.Status != "cancelled")
                 .ToListAsync();
 
-            var assignedBarber = allActiveBarbers.FirstOrDefault(b => !bookedBarberIds.Contains(b.Id));
-            if (assignedBarber == null) return BadRequest("No barbers are available for this time slot.");
+            // 2. Find who is specifically booked for this EXACT time slot
+            var bookedBarberIdsForSlot = todaysAppointments
+                .Where(a => a.TimeSlot == dto.TimeSlot)
+                .Select(a => a.BarberId)
+                .ToList();
+
+            // 3. Filter out barbers busy at this time, then sort the rest by their daily workload
+            var assignedBarber = allActiveBarbers
+                .Where(b => !bookedBarberIdsForSlot.Contains(b.Id)) // Must be free at this exact time
+                .OrderBy(b => todaysAppointments.Count(a => a.BarberId == b.Id)) // Sort by least amount of bookings today
+                .FirstOrDefault(); // Pick the one at the top of the list (least busy)
+
+            if (assignedBarber == null) return BadRequest("No barbers are available for this time slot. Please choose another time.");
 
             decimal finalPrice = haircut.Price;
             if (dto.DiscountAmount > 0) finalPrice -= dto.DiscountAmount;
@@ -75,7 +85,7 @@ namespace BarberShopBookingSystem.Controllers
             {
                 Id = Guid.NewGuid(),
                 UserId = userId,
-                BarberId = assignedBarber.Id, // Auto-assigned
+                BarberId = assignedBarber.Id, // Auto-assigned fairly!
                 HaircutId = dto.HaircutId,
                 AppointmentDate = appointmentDateUtc,
                 TimeSlot = dto.TimeSlot,
