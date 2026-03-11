@@ -56,12 +56,17 @@ namespace BarberShopBookingSystem.Controllers
             var haircut = await _context.Haircuts.FindAsync(dto.HaircutId);
             if (haircut == null) return NotFound("Haircut not found");
 
-            // POLICY: Auto-Assign Available Barber (Load Balanced)
+            // POLICY: Auto-Assign Available Barber (Load Balanced & Timezone Proof)
             var allActiveBarbers = await _context.Barbers.Where(b => b.Available).ToListAsync();
 
-            // 1. Get ALL appointments for this specific day to calculate their workloads
+            // 1. Force the date to completely ignore timezones by stripping it down to Year/Month/Day
+            var targetDate = dto.AppointmentDate.Date;
+
             var todaysAppointments = await _context.Appointments
-                .Where(a => a.AppointmentDate == appointmentDateUtc && a.Status != "cancelled")
+                .Where(a => a.AppointmentDate.Year == targetDate.Year &&
+                            a.AppointmentDate.Month == targetDate.Month &&
+                            a.AppointmentDate.Day == targetDate.Day &&
+                            a.Status != "cancelled")
                 .ToListAsync();
 
             // 2. Find who is specifically booked for this EXACT time slot
@@ -70,11 +75,12 @@ namespace BarberShopBookingSystem.Controllers
                 .Select(a => a.BarberId)
                 .ToList();
 
-            // 3. Filter out barbers busy at this time, then sort the rest by their daily workload
+            // 3. Filter out busy barbers, sort by workload, AND add a random tie-breaker
             var assignedBarber = allActiveBarbers
                 .Where(b => !bookedBarberIdsForSlot.Contains(b.Id)) // Must be free at this exact time
-                .OrderBy(b => todaysAppointments.Count(a => a.BarberId == b.Id)) // Sort by least amount of bookings today
-                .FirstOrDefault(); // Pick the one at the top of the list (least busy)
+                .OrderBy(b => todaysAppointments.Count(a => a.BarberId == b.Id)) // 1st Rule: Least busy today
+                .ThenBy(b => Guid.NewGuid()) // 2nd Rule: Tie-breaker! Pick randomly if they have the same amount
+                .FirstOrDefault();
 
             if (assignedBarber == null) return BadRequest("No barbers are available for this time slot. Please choose another time.");
 
